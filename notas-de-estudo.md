@@ -435,4 +435,43 @@ A revisão completa do módulo de Categorias encontrou e corrigiu quatro problem
 
 ---
 
+## 9. Relacionamentos JPA: `@OneToOne`, `@OneToMany`, `@ManyToOne`, `@ManyToMany`
+
+### Contexto
+Relacionamentos reais já presentes no projeto (módulos de Categoria/Produto/Usuário):
+```java
+// Category.java — lado "um"
+@OneToMany(mappedBy = "category", cascade = CascadeType.ALL)
+private List<Product> products;
+
+// Product.java — lado "muitos", duas relações @ManyToOne
+@ManyToOne
+@JoinColumn(name = "category_id")
+private Category category;
+
+@ManyToOne
+@JoinColumn(name = "seller_id")
+private User user;
+
+// User.java — inverso do relacionamento com Product, + ManyToMany com Role
+@OneToMany(mappedBy = "user", cascade = { CascadeType.PERSIST, CascadeType.MERGE }, orphanRemoval = true)
+private Set<Product> products;
+
+@ManyToMany(cascade = { CascadeType.PERSIST, CascadeType.MERGE }, fetch = FetchType.EAGER)
+@JoinTable(name = "user_role", joinColumns = @JoinColumn(name = "user_id"), inverseJoinColumns = @JoinColumn(name = "role_id"))
+private Set<Role> roles = new HashSet<>();
+```
+
+### Explicação
+- **`@OneToMany` e `@ManyToOne` não são relações diferentes — são a mesma relação vista de dois ângulos.** O lado que se associa a só **um** registro do outro lado (`Product.category`, `Product.user`) é o `@ManyToOne`, e é sempre ele quem guarda a chave estrangeira no banco via `@JoinColumn` — o **lado dono**. O lado que enxerga uma **coleção** (`Category.products`, `User.products`) é o `@OneToMany`, e usa `mappedBy = "nomeDoCampoNoOutroLado"` (nome do **campo Java**, não da coluna do banco) pra dizer "a FK já está mapeada lá, não crie nada novo aqui" — o **lado inverso**.
+- **Regra prática pra decidir qual anotação usar**: olhar pra onde a chave estrangeira mora fisicamente na tabela — ela sempre fica do lado "muitos" (ex.: `products.category_id`, `products.seller_id`). Esse lado ganha `@ManyToOne` + `@JoinColumn`; o outro ganha `@OneToMany(mappedBy = ...)`.
+- **`@ManyToMany`** (ex.: `User`↔`Role`) surge quando nenhum dos dois lados pode guardar sozinho a FK, porque os dois lados são "muitos" ao mesmo tempo. A solução é uma **tabela de junção** (`@JoinTable`) com duas FKs — `joinColumns` aponta pra própria entidade, `inverseJoinColumns` pra outra. No projeto, é unidirecional (só `User` enxerga `roles`; `Role` não tem `@ManyToMany(mappedBy = "roles")` de volta).
+- **`@OneToOne`** não é usada ainda no projeto, mas segue o mesmo padrão dono/inverso do `@OneToMany`/`@ManyToOne` — só que nenhum dos lados usa coleção, cada um enxerga um único objeto.
+- **`cascade`** propaga operações (salvar/deletar) da entidade "pai" pras relacionadas; **`orphanRemoval = true`** (em `User.products`) vai além, deletando a entidade filha se ela for removida da coleção mesmo sem deletar o pai; **`fetch`** controla quando os dados relacionados são buscados (`EAGER` = sempre junto; `LAZY`, padrão de `@OneToMany`/`@ManyToMany` = só quando acessado).
+
+### 📌 Resumo
+`@OneToMany` e `@ManyToOne` descrevem a mesma relação a partir de dois ângulos diferentes: o lado que se associa a apenas um registro do outro lado é sempre o `@ManyToOne`, e é ele quem guarda a chave estrangeira no banco via `@JoinColumn` (o lado dono); o lado que enxerga uma coleção é o `@OneToMany`, e usa `mappedBy` (apontando pro nome do campo Java do outro lado, não da coluna) para dizer que não deve criar nenhuma FK própria (o lado inverso) — a regra prática pra decidir qual anotação usar é lembrar que a FK sempre mora fisicamente na tabela do lado "muitos". `@ManyToMany` aparece quando os dois lados são "muitos" ao mesmo tempo (nenhum pode guardar a FK sozinho), resolvido com uma tabela de junção (`@JoinTable`) contendo duas FKs; `@OneToOne` segue o mesmo raciocínio de dono/inverso, mas sem coleção em nenhum dos lados. No projeto, `Category`↔`Product` e `User`↔`Product` (como vendedor) são exemplos de `OneToMany`/`ManyToOne`, e `User`↔`Role` é um exemplo de `ManyToMany` unidirecional via tabela `user_role`.
+
+---
+
 *Arquivo criado para consulta pessoal de estudo — atualizar conforme novos conceitos forem estudados no projeto.*
