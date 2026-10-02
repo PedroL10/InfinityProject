@@ -514,11 +514,74 @@ Em vez do servidor guardar uma sessão (cookie de sessão tradicional), o client
 
 **Requisição autenticada depois do login** (ex.: `GET /api/auth/user`): o navegador manda o cookie automaticamente → `AuthTokenFilter` intercepta **antes** de qualquer Controller, extrai e valida o JWT, busca o usuário de novo, popula `SecurityContextHolder` → o Controller recebe `Authentication` já pronto. Se o token estiver ausente/inválido num recurso protegido, `AuthEntryPointJwt` devolve 401 em JSON.
 
-### Observação (não corrigida ainda)
-`UserDetailsImpl` sobrescreve `equals()` mas não `hashCode()` (o Lombok avisa isso) — viola o contrato equals/hashCode do Java, podendo causar bugs sutis se o objeto for usado como chave de `HashMap`/`HashSet`. Também, `AuthController.authenticateUser` devolve **404** em credenciais inválidas, quando o status mais correto seria **401 Unauthorized**.
+### Observação (✅ corrigida — ver seção 11)
+`UserDetailsImpl` sobrescrevia `equals()` mas não `hashCode()`, e `AuthController.authenticateUser` devolvia 404 em credenciais inválidas em vez de 401. Ambos corrigidos — ver seção 11.
 
 ### 📌 Resumo
 O módulo de autenticação implementa login stateless com JWT entregue via cookie HTTP: `User`/`Role`/`AppRole` são o modelo de dados, traduzidos para o mundo do Spring Security por `UserDetailsImpl` (adaptador que embrulha `User` no formato `UserDetails`) e `UserDetailsServiceImpl` (busca o usuário por username); `JwtUtils` concentra toda a criptografia do token (gerar, validar, extrair username, embrulhar em cookie); `AuthTokenFilter` roda em toda requisição reconstruindo a identidade do usuário a partir do cookie (sem sessão no servidor), enquanto `AuthEntryPointJwt` devolve 401 em JSON quando falta autenticação válida; `WebSecurityConfig` amarra tudo — define o `AuthenticationProvider`, o `PasswordEncoder` (BCrypt), as regras de URL liberadas vs protegidas, registra o filtro JWT antes do filtro padrão do Spring, e popula dados de teste na subida via `CommandLineRunner`; e `AuthController` expõe os endpoints `/signin`, `/signup`, `/username`, `/user` e `/signout` que costuram esse fluxo pro cliente. No login, o `AuthenticationManager` delega pro `DaoAuthenticationProvider`, que usa `UserDetailsServiceImpl` pra buscar o usuário e `PasswordEncoder` pra comparar a senha hasheada; em requisições seguintes, é o `AuthTokenFilter` quem reidentifica o usuário a partir do cookie, a cada chamada.
+
+---
+
+## 11. Rodada de correções — Autenticação, Produto, Categoria e injeção por construtor
+
+### Contexto
+A partir do mapa de melhorias da seção 9 do `DOCUMENTACAO-PROJETO.md`, 18 itens foram corrigidos de uma vez. Agrupados por tema:
+
+### Autenticação
+- **`/api/public/**` voltou a ser `permitAll()`** no `WebSecurityConfig` — a linha estava comentada, fazendo a leitura pública de categorias/produtos exigir login sem necessidade. `/api/admin/**` continua **de propósito** fora do `permitAll()`, caindo no `anyRequest().authenticated()` — ou seja, operações administrativas exigem login (qualquer usuário autenticado, não necessariamente um papel específico — autorização por papel, tipo `hasRole("ADMIN")`, ficou fora de escopo por enquanto).
+- **Login com credenciais inválidas agora devolve 401**, não mais 404 (`AuthController.authenticateUser`).
+- **Cookie JWT agora é `httpOnly(true)`** (`JwtUtils.generateJwtCookie`) — o token deixa de ser acessível via JavaScript no navegador, mitigando roubo de token via XSS. Não quebra nada porque o token também já vinha (e continua vindo) no corpo JSON da resposta de login (`UserInfoResponse.jwtToken`), então nenhum fluxo legítimo dependia de ler o cookie via JS.
+- **Race condition no cadastro corrigida**: `AuthController.registerUser` agora captura `DataIntegrityViolationException` ao redor do `save()`, devolvendo 400 amigável em vez de erro 500 cru se duas requisições concorrentes tentarem criar o mesmo username/email (a tabela `users` já tinha `@UniqueConstraint` — faltava só capturar a exceção).
+- **`UserDetailsImpl` ganhou `hashCode()`** consistente com o `equals()` existente (baseado em `id`), corrigindo a violação do contrato Java.
+- **Papéis de cadastro inválidos agora retornam 400** em vez de cair silenciosamente em `ROLE_USER` — o `switch` em `AuthController.registerUser` virou um `for` explícito (em vez de `forEach`) para permitir `return` antecipado assim que um valor de papel não reconhecido aparece.
+
+### Produto
+- **Constraint `UNIQUE` composta `(category_id, product_name)`** adicionada em `Product` (`@Table(uniqueConstraints = ...)`) — reflete a regra de negócio real (nome não pode repetir *dentro da mesma categoria*, mas pode repetir entre categorias diferentes; por isso não é um `@Column(unique = true)` simples como em `Category`).
+- **`addProduct` e `updateProduct` agora capturam `DataIntegrityViolationException`** ao redor do `save()`, convertendo a violação da constraint acima numa `APIException` amigável — igual ao padrão já usado em Categoria.
+- **`Product.productId` trocado de `GenerationType.AUTO` para `GenerationType.IDENTITY`**, por consistência com `Category`/`User`.
+
+### Categoria
+- **`Category.products` agora inicializado com `= new ArrayList<>()`**, igual `User.addresses`/`User.products` — elimina o risco (baixo, mas existente) de `NullPointerException` se a entidade for construída manualmente fora do JPA.
+- **`Category.categoryName` ganhou `@Size(max = 100)`** (antes só tinha `min = 5`) — nomes muito longos agora falham com 400 amigável em vez de erro de truncamento no banco.
+- **`APIResponse.message` virou campo `private`** (antes era `public`), consistente com `status`; o getter/setter continuam gerados pelo Lombok (`@Data`).
+- **`MyGlobalExceptionHandler` ganhou um `@ExceptionHandler(Exception.class)` genérico**, devolvendo `APIResponse` com 500 para qualquer exceção não prevista — isso também cobre, na prática, o caso de um `sortBy` inválido (nome de campo inexistente), que agora volta formatado em vez de estourar uma página de erro padrão do Spring.
+- `CategoryResponse.totalPages` já estava correto (camelCase) — esse item da lista original já tinha sido resolvido antes, sem necessidade de nova ação.
+
+### Transversal
+- **Injeção por construtor** substituiu `@Autowired` em campo em: `CategoryController`, `CategoryServiceImpl`, `ProductController`, `ProductServiceImpl`, `AuthController`, `WebSecurityConfig`, `UserDetailsServiceImpl`, `AuthTokenFilter` — usando `@RequiredArgsConstructor` do Lombok sobre campos `private final`. Isso exigiu uma mudança em cadeia: como `WebSecurityConfig` criava `AuthTokenFilter` manualmente (`new AuthTokenFilter()`), o `@Bean authenticationJwtTokenFilter(...)` passou a receber `JwtUtils` e `UserDetailsServiceImpl` como parâmetros (o Spring injeta), repassando pro construtor do filtro; e o `filterChain(...)` passou a receber o próprio `AuthTokenFilter` como parâmetro do método, em vez de chamá-lo manualmente.
+- **Limpeza**: dois arquivos órfãos (`security/jwt/LoginRequest.java` e `security/jwt/LoginResponse.java`, duplicados dos que já existiam em `security/request/`/`security/response/`, sem nenhuma referência no projeto) foram removidos.
+
+### 📌 Resumo
+Dezoito pontos do mapa de melhorias foram corrigidos nesta rodada: em Autenticação, `/api/public/**` voltou a ser público (mantendo `/api/admin/**` protegido de propósito), login inválido passou a devolver 401, o cookie JWT ganhou `httpOnly`, o cadastro ganhou proteção contra corrida de duplicidade, `UserDetailsImpl` ganhou `hashCode()` e papéis inválidos no cadastro passaram a ser rejeitados explicitamente; em Produto, uma constraint única composta por categoria+nome substituiu a checagem em memória, com captura de `DataIntegrityViolationException` tanto na criação quanto na atualização, e o ID passou a usar `IDENTITY` como as demais entidades; em Categoria, a coleção de produtos ganhou inicializador, o nome ganhou um `@Size(max=...)`, e o handler global de exceções ganhou um catch-all genérico que também neutraliza o problema de `sortBy` inválido; e, transversalmente, toda injeção de dependência por campo foi convertida para injeção por construtor via Lombok, o que exigiu ajustar como `AuthTokenFilter` é construído dentro de `WebSecurityConfig`. O projeto compila sem nenhum erro após todas as mudanças.
+
+---
+
+## 12. Por que remover `@Autowired` de campo não quebra a injeção de dependência
+
+### Contexto
+Na rodada de correções da seção 11, toda injeção por campo foi convertida para injeção por construtor. Exemplo (`AuthController`):
+```java
+// Antes
+@Autowired
+private JwtUtils jwtUtils;
+
+// Depois
+@RequiredArgsConstructor   // anotação de classe, do Lombok
+public class AuthController {
+    private final JwtUtils jwtUtils;
+    // ...
+}
+```
+
+### Explicação
+- **Injeção por campo** (`@Autowired` numa variável): o Spring cria o objeto com um construtor vazio e, depois, usa reflection para preencher os campos privados diretamente — funciona, mas é hoje considerado prática desencorajada.
+- **`@RequiredArgsConstructor`** é do Lombok, não do Spring: gera, em tempo de compilação, um construtor recebendo um parâmetro para cada campo `final` da classe.
+- **Por que não precisa de `@Autowired` no construtor gerado**: desde o Spring 4.3 (2016), se uma classe gerenciada pelo Spring tem **um único construtor**, o Spring o usa automaticamente para injetar as dependências, sem anotação nenhuma. `@Autowired` só seria necessário se houvesse mais de um construtor e o Spring precisasse de uma dica de qual usar. A injeção continua acontecendo — só muda o mecanismo (construtor em vez de reflection pós-criação).
+- **Vantagens**: imutabilidade (campos `final` nunca são reatribuídos depois de criados); falha rápida — se faltar algum bean no contexto, o erro aparece na subida da aplicação, não só quando o campo `null` for usado; testabilidade — dá pra fazer `new Classe(mocks...)` direto, sem reflection ou anotações especiais de teste; e a assinatura do construtor já documenta as dependências da classe.
+- **Efeito em cadeia**: `WebSecurityConfig` criava `AuthTokenFilter` manualmente (`new AuthTokenFilter()`, construtor vazio). Quando `AuthTokenFilter` passou a exigir duas dependências no construtor, esse `new AuthTokenFilter()` parou de compilar — corrigido fazendo o `@Bean authenticationJwtTokenFilter(...)` receber `JwtUtils`/`UserDetailsServiceImpl` como parâmetros do método (o Spring injeta), repassando pro construtor do filtro.
+
+### 📌 Resumo
+Remover `@Autowired` dos campos não quebra a injeção de dependência — ela continua acontecendo, só que por um mecanismo diferente: em vez do Spring criar o objeto vazio e preencher os campos privados via reflection depois (injeção por campo), o Lombok (`@RequiredArgsConstructor`) gera um único construtor recebendo todas as dependências como parâmetros, e o Spring, desde a versão 4.3, injeta automaticamente nesse construtor sempre que existe só um (sem precisar de `@Autowired`, que só seria necessário com mais de um construtor ambíguo). A vantagem é imutabilidade (campos `final`), falha rápida na subida da aplicação se faltar algum bean, e testes mais simples; o efeito colateral foi precisar ajustar `WebSecurityConfig`, que construía `AuthTokenFilter` manualmente e passou a repassar as dependências pelo próprio método `@Bean`.
 
 ---
 

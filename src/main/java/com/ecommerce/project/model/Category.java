@@ -1,5 +1,6 @@
 package com.ecommerce.project.model;
 
+import java.util.ArrayList;
 import java.util.List;
 
 import jakarta.persistence.CascadeType;
@@ -25,10 +26,10 @@ public class Category {
     private Long categoryId;
 
     @NotBlank
-    @Size(min = 5, message = "Category name must contain at least 5 characters")
+    @Size(min = 5, max = 100, message = "Category name must be between 5 and 100 characters")
     @Column(unique = true)
     private String categoryName;
 
     @OneToMany(mappedBy = "category", cascade = CascadeType.ALL)
-    private List<Product> products;
+    private List<Product> products = new ArrayList<>();
 }

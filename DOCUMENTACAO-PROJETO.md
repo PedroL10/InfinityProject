@@ -2,7 +2,7 @@
 
 Documento de arquitetura e referência técnica do projeto, mantido como material de apoio para explicar o projeto em entrevistas. Diferente do `notas-de-estudo.md` (que registra perguntas e respostas pontuais sobre conceitos), este arquivo descreve o projeto como um todo: visão geral, arquitetura, decisões de design e pontos de atenção.
 
-> Última atualização: 2026-10-02 (módulo de autenticação — Spring Security + JWT)
+> Última atualização: 2026-10-02 (rodada de correções: autenticação, produto, categoria e injeção por construtor)
 
 ---
 
@@ -174,15 +174,15 @@ Fluxo análogo para `POST`/`PUT`/`DELETE`, todos recebendo/devolvendo `CategoryD
 ### Autenticação
 | Método | Endpoint | Request body | Resposta de sucesso | Observação |
 |---|---|---|---|---|
-| POST | `/api/auth/signup` | `SignupRequest` | 200 + `MessageResponse` | `APIException`/400 se username ou email já existem |
-| POST | `/api/auth/signin` | `LoginRequest` | 200 + `UserInfoResponse` + cookie `Set-Cookie` com o JWT | credenciais inválidas → **404** (deveria ser 401 — ver seção 9) |
+| POST | `/api/auth/signup` | `SignupRequest` | 200 + `MessageResponse` | 400 se username/email já existem, ou se algum `role` enviado não for `admin`/`seller`/`user` |
+| POST | `/api/auth/signin` | `LoginRequest` | 200 + `UserInfoResponse` + cookie `Set-Cookie` (`httpOnly`) com o JWT | credenciais inválidas → **401** |
 | GET | `/api/auth/username` | — | 200 + username (texto puro) | requer cookie JWT válido |
 | GET | `/api/auth/user` | — | 200 + `UserInfoResponse` | requer cookie JWT válido |
 | POST | `/api/auth/signout` | — | 200 + `MessageResponse`, cookie JWT limpo | — |
 
-Erros (`APIException`/`ResourceNotFoundException`) sempre voltam como `APIResponse` (`{message, status: false}`); falhas de `@Valid` voltam como `Map<String,String>` (`{campo: mensagem}`).
+Erros (`APIException`/`ResourceNotFoundException`) sempre voltam como `APIResponse` (`{message, status: false}`); falhas de `@Valid` voltam como `Map<String,String>` (`{campo: mensagem}`); qualquer outra exceção inesperada agora também volta como `APIResponse` (500), via o handler genérico do `MyGlobalExceptionHandler`.
 
-> **Importante**: no `WebSecurityConfig` atual, as regras `permitAll()` para `/api/admin/**` e `/api/public/**` estão **comentadas** — ou seja, **todos** os endpoints de Categoria e Produto acima exigem um cookie JWT válido (login prévio), exceto `/api/auth/**`, `/h2-console/**`, `/swagger-ui/**`, `/api/test/**` e `/images/**`. Veja o guia de testes (seção 11) para o passo a passo de login antes de testar Categoria/Produto.
+> **Importante**: no `WebSecurityConfig`, `/api/public/**` é `permitAll()` (leitura de categorias/produtos sem login); `/api/admin/**` fica **de propósito** fora do `permitAll()`, exigindo um cookie JWT válido (qualquer usuário autenticado — autorização por papel específico, tipo `hasRole("ADMIN")`, ainda não implementada). Veja o guia de testes (seção 11) para o passo a passo de login antes de testar os endpoints `/api/admin/**`.
 
 ## 8. Conceitos para citar numa entrevista técnica
 
@@ -197,31 +197,12 @@ Erros (`APIException`/`ResourceNotFoundException`) sempre voltam como `APIRespon
 
 Ótimo material para entrevista ("o que você faria diferente / o que sabe que está incompleto"). Organizado por módulo e por severidade (🔴 alta, 🟡 média, 🟢 baixa/estilo).
 
-### Ainda em aberto — Autenticação (módulo novo)
-1. 🔴 **`/api/admin/**` e `/api/public/**` comentados no `WebSecurityConfig`** — hoje **tudo** que não é `/api/auth/**`, `/h2-console/**`, `/swagger-ui/**`, `/api/test/**` ou `/images/**` exige login. Decidir conscientemente: reativar `permitAll()` nos endpoints que devem ser públicos (leitura de categorias/produtos, por exemplo), ou manter tudo protegido e ajustar o fluxo esperado do cliente.
-2. 🔴 **Credenciais inválidas no login devolvem 404** (`AuthController.authenticateUser`) — deveria ser **401 Unauthorized**; 404 sugere "recurso não existe", não "senha errada".
-3. 🟡 **Cookie JWT gerado com `httpOnly(false)`** (`JwtUtils.generateJwtCookie`) — o token fica acessível via JavaScript no navegador, vulnerável a roubo via XSS. O padrão recomendado é `httpOnly(true)`.
-4. 🟡 **Race condition no cadastro** (`AuthController.registerUser`) — `existsByUserName`/`existsByEmail` (checagem) e `save` (gravação) são operações separadas sem trava; a tabela `users` já tem `@UniqueConstraint`, mas não há captura de `DataIntegrityViolationException`, então uma corrida concorrente gera um 500 cru em vez de mensagem amigável (mesmo padrão já corrigido em Categoria — ver item 17).
-5. 🟡 **`UserDetailsImpl` sobrescreve `equals()` sem sobrescrever `hashCode()`** — viola o contrato Java; risco de bug sutil se o objeto for usado como chave de `HashMap`/`HashSet`.
-6. 🟢 **Papéis de cadastro como strings soltas** (`SignupRequest.role: Set<String>`, comparadas num `switch` em `AuthController`) — um valor não reconhecido cai silenciosamente no `default` (`ROLE_USER`), sem avisar o cliente que o papel pedido era inválido.
-7. 🟢 **`spring.app.jwtSecret` hardcoded em `application.properties` versionado** — aceitável em projeto de estudo; em produção iria para variável de ambiente/secret manager.
-
-### Ainda em aberto — Produto
-8. 🟡 **`Product.productName` sem constraint `unique` no banco** (diferente de `Category.categoryName`) — a checagem de duplicidade em `addProduct` roda em memória, iterando `category.getProducts()`, sem proteção real contra concorrência.
-9. 🟡 **`updateProduct` não valida nome duplicado** — permite atualizar um produto para um nome já usado por outro produto da mesma categoria.
-10. 🟢 **`Product` usa `GenerationType.AUTO`, `Category`/`User` usam `GenerationType.IDENTITY`** — inconsistência de estratégia de geração de ID entre entidades do mesmo projeto.
-11. 🟢 **`Category.products` sem inicializador** (`private List<Product> products;`, sem `= new ArrayList<>()`) — diferente de `User.addresses`/`User.products`. Risco baixo (Hibernate popula a coleção ao carregar via JPA), mas inconsistente e arriscado se a entidade for construída manualmente (ex. em um teste).
-
-### Ainda em aberto — Categoria
-12. 🟢 **`sortBy` não é validado** contra os campos reais da entidade — nome de campo inexistente só falha em runtime.
-13. 🟢 **Sem handler genérico para exceções inesperadas** (`@ExceptionHandler(Exception.class)`) — qualquer exceção fora de `MethodArgumentNotValidException`/`ResourceNotFoundException`/`APIException` cai no tratamento padrão do Spring, fora do formato `APIResponse`.
-14. 🟢 **`Category.categoryName` sem `@Size(max=...)`** — só tem `min = 5`.
-15. 🟢 **`CategoryResponse.totalpages` foge do padrão camelCase** (deveria ser `totalPages`).
-16. 🟢 **`APIResponse.message` é campo `public`**, inconsistente com `status` (`private` + getter/setter).
-
-### Transversal (todos os módulos)
-17. 🟡 **Nenhum teste automatizado em todo o projeto** — nem unitário nem de integração, em Categoria, Produto ou Autenticação.
-18. 🟢 **Vários `@Autowired` em campo em vez de injeção via construtor** (sinalizado pelo próprio Spring Tools no VS Code) — construtor facilita testes e permite campos `final`.
+### Ainda em aberto
+1. 🟡 **Sem testes automatizados** — nem unitário nem de integração, em Categoria, Produto ou Autenticação.
+2. 🟢 **`sortBy` não é validado explicitamente** contra os campos reais da entidade — um nome de campo inexistente agora é capturado pelo handler genérico (item 40) e volta como `APIResponse` 500, em vez de estourar a página de erro padrão do Spring; mas o ideal seria validar antes, devolvendo 400.
+3. 🟢 **`spring.app.jwtSecret` com valor placeholder em `application.properties` versionado** — já externalizado via `${JWT_SECRET:...}`; em produção, a variável de ambiente precisa ser definida com um valor real.
+4. 🟢 **Autorização por papel ainda não implementada** — `/api/admin/**` exige login (qualquer usuário autenticado), mas não restringe por papel (`hasRole("ADMIN")`/`hasRole("SELLER")`); qualquer usuário logado, independente do papel, consegue criar/editar/deletar categorias e produtos hoje.
+5. 🟢 **`APIResponse.status` sempre `false` nos handlers atuais** — o campo existe para indicar sucesso/falha, mas só é usado no caminho de erro.
 
 ### Já corrigidos (histórico)
 19. ~~`updateCategory` não retorna os dados atualizados~~ — corrigido: devolve `CategoryDTO` atualizado.
@@ -240,6 +221,21 @@ Erros (`APIException`/`ResourceNotFoundException`) sempre voltam como `APIRespon
 32. ~~Pacotes `security.jwt` declarados errados~~ (2026-10-02) — arquivos moveram fisicamente para `security/jwt/`, pacote corrigido.
 33. ~~Import `com.fasterxml.jackson.databind.ObjectMapper` incompatível~~ (2026-10-02) — projeto usa Jackson 3 (Spring Boot 4.1); corrigido para `tools.jackson.databind.ObjectMapper`.
 34. ~~`DaoAuthenticationProvider()` sem argumentos e `setUserDetailsService(...)` removidos no Spring Security 7~~ (2026-10-02) — corrigido usando `new DaoAuthenticationProvider(userDetailsService)`.
+35. ~~`/api/admin/**`/`/api/public/**` comentados~~ (2026-10-02) — `/api/public/**` voltou a ser `permitAll()`; `/api/admin/**` fica protegido de propósito (exige login).
+36. ~~Credenciais inválidas no login devolviam 404~~ (2026-10-02) — corrigido para 401 Unauthorized.
+37. ~~Cookie JWT com `httpOnly(false)`~~ (2026-10-02) — corrigido para `httpOnly(true)`.
+38. ~~Race condition no cadastro~~ (2026-10-02) — corrigido com captura de `DataIntegrityViolationException` ao redor do `save()`.
+39. ~~`UserDetailsImpl` sem `hashCode()`~~ (2026-10-02) — adicionado, consistente com `equals()` (baseado em `id`).
+40. ~~Papéis de cadastro inválidos caíam silenciosamente em `ROLE_USER`~~ (2026-10-02) — agora retornam 400 explicitamente.
+41. ~~`Product.productName` sem constraint única~~ (2026-10-02) — adicionada constraint composta `(category_id, product_name)`, refletindo a regra real (nome único por categoria, não globalmente).
+42. ~~`updateProduct` não validava nome duplicado~~ (2026-10-02) — corrigido com a constraint acima + captura de `DataIntegrityViolationException`.
+43. ~~`Product` usava `GenerationType.AUTO`~~ (2026-10-02) — alinhado para `IDENTITY`, como `Category`/`User`.
+44. ~~`Category.products` sem inicializador~~ (2026-10-02) — corrigido com `= new ArrayList<>()`.
+45. ~~Sem handler genérico de exceções~~ (2026-10-02) — adicionado `@ExceptionHandler(Exception.class)` em `MyGlobalExceptionHandler`.
+46. ~~`Category.categoryName` sem `@Size(max=...)`~~ (2026-10-02) — adicionado `max = 100`.
+47. ~~`APIResponse.message` era campo `public`~~ (2026-10-02) — corrigido para `private`.
+48. ~~Injeção por campo em vez de construtor~~ (2026-10-02) — convertido para `@RequiredArgsConstructor`/`final` em `CategoryController`, `CategoryServiceImpl`, `ProductController`, `ProductServiceImpl`, `AuthController`, `WebSecurityConfig`, `UserDetailsServiceImpl` e `AuthTokenFilter`.
+49. ~~Arquivos órfãos `security/jwt/LoginRequest.java`/`LoginResponse.java`~~ (2026-10-02) — duplicados sem nenhuma referência no projeto, removidos.
 
 ## 10. Perguntas comuns de entrevista sobre este projeto (e como responder)
 
@@ -265,7 +261,7 @@ Erros (`APIException`/`ResourceNotFoundException`) sempre voltam como `APIRespon
 
 Reinicie a aplicação antes de começar (H2 em memória — dados são recriados do zero, inclusive os usuários de teste do `CommandLineRunner`). Habilite "Automatically follow redirects" e deixe o gerenciador de cookies do Postman ativo (padrão) — ele guarda o cookie JWT automaticamente entre requisições, como um navegador faria.
 
-> Como as regras `permitAll()` de `/api/admin/**` e `/api/public/**` estão comentadas (ver seção 9, item 1), **é preciso logar antes de testar Categoria e Produto** — sem isso, qualquer chamada devolve 401 do `AuthEntryPointJwt`.
+> `/api/public/**` (leitura de categorias/produtos) não exige login. **`/api/admin/**` exige** — é preciso logar antes de criar/editar/deletar categorias ou produtos, senão a chamada devolve 401 do `AuthEntryPointJwt`.
 
 ### 11.1 Autenticação
 
@@ -288,7 +284,7 @@ POST /api/auth/signup
     "role": ["seller"]
 }
 ```
-✅ Esperado: 200, `{"message": "User registered successfully!"}`. `role` é opcional — omitindo, o usuário vira `ROLE_USER`. Valores aceitos: `"admin"`, `"seller"`, qualquer outro (ou ausência) vira `"user"`.
+✅ Esperado: 200, `{"message": "User registered successfully!"}`. `role` é opcional — omitindo, o usuário vira `ROLE_USER`. Valores aceitos: `"admin"`, `"seller"`, `"user"`; qualquer outro valor devolve 400 explicando que o papel é inválido.
 
 Repetir o mesmo body → 400, `{"message": "Error: Username is already taken!"}`.
 
@@ -308,7 +304,7 @@ Senha errada:
 ```json
 { "username": "admin", "password": "errada" }
 ```
-✅ Esperado hoje: **404** (item 2 da seção 9 — deveria ser 401).
+✅ Esperado: **401 Unauthorized**, `{"message": "Bad credentials", "status": false}`.
 
 **3. Dados do usuário logado**
 ```

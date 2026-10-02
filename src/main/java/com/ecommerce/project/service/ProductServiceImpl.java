@@ -4,8 +4,8 @@ import java.io.IOException;
 import java.util.List;
 
 import org.modelmapper.ModelMapper;
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Pageable;
@@ -22,20 +22,19 @@ import com.ecommerce.project.payload.ProductResponse;
 import com.ecommerce.project.repositories.CategoryRepository;
 import com.ecommerce.project.repositories.ProductRepository;
 
+import lombok.RequiredArgsConstructor;
+
 @Service
+@RequiredArgsConstructor
 public class ProductServiceImpl implements ProductService {
 
-        @Autowired
-        private ProductRepository productRepository;
+        private final ProductRepository productRepository;
 
-        @Autowired
-        private CategoryRepository categoryRepository;
+        private final CategoryRepository categoryRepository;
 
-        @Autowired
-        private ModelMapper modelMapper;
+        private final ModelMapper modelMapper;
 
-        @Autowired
-        private FileService fileService;
+        private final FileService fileService;
 
         @Value("${project.image}")
         private String path;
@@ -63,7 +62,12 @@ public class ProductServiceImpl implements ProductService {
                         double specialPrice = product.getPrice() -
                                         ((product.getDiscount() * 0.01) * product.getPrice());
                         product.setSpecialPrice(specialPrice);
-                        Product savedProduct = productRepository.save(product);
+                        Product savedProduct;
+                        try {
+                                savedProduct = productRepository.save(product);
+                        } catch (DataIntegrityViolationException e) {
+                                throw new APIException("Product already exist!!");
+                        }
                         return modelMapper.map(savedProduct, ProductDTO.class);
                 } else {
                         throw new APIException("Product already exist!!");
@@ -174,7 +178,14 @@ public class ProductServiceImpl implements ProductService {
                                 ((productFromDb.getDiscount() * 0.01) * productFromDb.getPrice());
                 productFromDb.setSpecialPrice(specialPrice);
 
-                Product savedProduct = productRepository.save(productFromDb);
+                Product savedProduct;
+                try {
+                        savedProduct = productRepository.save(productFromDb);
+                } catch (DataIntegrityViolationException e) {
+                        throw new APIException(
+                                        "Product with the name " + productFromDb.getProductName()
+                                                        + " already exists in this category!!!");
+                }
 
                 return modelMapper.map(savedProduct, ProductDTO.class);
         }
