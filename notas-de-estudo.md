@@ -585,4 +585,41 @@ Remover `@Autowired` dos campos não quebra a injeção de dependência — ela 
 
 ---
 
+## 13. O que é race condition — o caso do cadastro de usuário
+
+### Contexto
+```java
+// AuthController.registerUser — antes da correção
+if (userRepository.existsByUserName(signUpRequest.getUsername())) {   // 1. CHECA
+    return ResponseEntity.badRequest()...
+}
+// ... hash de senha, resolução de papéis ...
+userRepository.save(user);                                              // 2. AGE (grava)
+```
+```java
+// Depois da correção
+try {
+    userRepository.save(user);
+} catch (DataIntegrityViolationException e) {
+    return ResponseEntity.badRequest()
+            .body(new MessageResponse("Error: Username or email is already in use!"));
+}
+```
+
+### Explicação
+**Race condition** é um bug que só existe sob concorrência: duas execuções (threads, requisições) acessando o mesmo recurso compartilhado ao mesmo tempo, com o resultado dependendo da ordem/timing de execução, não da lógica do código em si — o código, lido sozinho, parece correto; o bug só aparece quando duas execuções dele rodam simultaneamente.
+
+O padrão específico aqui é **"check-then-act" (TOCTOU — Time-Of-Check to Time-Of-Use)**: checar uma condição (`existsByUserName`) e, só depois, agir (`save`) — como são duas operações SQL separadas, com código Java entre elas (hash de senha, busca de roles), existe uma janela de tempo onde a corrida acontece.
+
+**Linha do tempo do bug**: Thread A checa "pedro" existe? → não. Thread B checa "pedro" existe? → não (A ainda não salvou). As duas acham que têm via livre e tentam salvar — gerando duplicata ou erro cru.
+
+**Por que a correção funciona de verdade**: a checagem em Java nunca consegue garantir atomicidade sozinha. Quem garante é o banco de dados, através da constraint `@UniqueConstraint` já existente na tabela `users` — um índice único é garantido atomicamente pelo motor do banco, não importa quantas conexões tentem inserir o mesmo valor ao mesmo tempo; só uma gravação terá sucesso. O Spring traduz o erro de violação (que varia por banco/driver) numa exceção padronizada, `DataIntegrityViolationException` (camada de "exception translation"), que agora é capturada para devolver 400 amigável em vez de erro cru.
+
+**Por que manter as duas camadas**: a checagem antecipada é o caminho feliz (resposta rápida e específica, evita gastar tempo com hash de senha num cadastro que já ia falhar); a captura da exceção é a rede de segurança real para o caso raro de concorrência, apoiada numa garantia atômica do banco. Mesmo padrão já aplicado antes em `CategoryServiceImpl.createCategory` e `ProductServiceImpl.addProduct`/`updateProduct`.
+
+### 📌 Resumo
+Race condition é um bug que só existe sob concorrência: duas execuções acessando o mesmo recurso compartilhado ao mesmo tempo, com o resultado dependendo da ordem/timing de execução. O padrão "check-then-act" (checar se existe, depois gravar) é vulnerável porque são duas operações separadas, com uma janela de tempo no meio onde duas requisições simultâneas podem ambas passar pela checagem antes de qualquer uma ter salvo. A correção de verdade não está na checagem (que continua "enganável"), e sim na constraint `UNIQUE` do banco, garantida atomicamente pelo próprio motor de banco de dados — o Spring traduz a violação numa `DataIntegrityViolationException` padronizada, que passamos a capturar para devolver uma resposta amigável em vez de erro cru. A checagem antecipada continua existindo como atalho para o caso comum; a captura da exceção é a garantia real para o caso raro de concorrência.
+
+---
+
 *Arquivo criado para consulta pessoal de estudo — atualizar conforme novos conceitos forem estudados no projeto.*
