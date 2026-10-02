@@ -474,4 +474,52 @@ private Set<Role> roles = new HashSet<>();
 
 ---
 
+## 10. Módulo de autenticação (Spring Security + JWT) — como o login funciona
+
+### Contexto
+Desde o último commit (`2ed3b96`), foi implementado um módulo completo de autenticação stateless com JWT. Novas dependências (`pom.xml`): `spring-boot-starter-security`, `jjwt-api`/`jjwt-impl`/`jjwt-jackson`. Novas propriedades (`application.properties`): `spring.app.jwtSecret`, `spring.app.jwtExpirationMs`, `spring.ecom.app.jwtCookieName`. Novos arquivos: `repositories/UserRepository.java`, `repositories/RoleRepository.java`, `controller/AuthController.java`, e todo o pacote `security/` (`jwt/`, `request/`, `response/`, `services/`, `WebSecurityConfig.java`).
+
+### A ideia central: autenticação stateless com JWT
+Em vez do servidor guardar uma sessão (cookie de sessão tradicional), o cliente loga **uma vez**, recebe um **token assinado** (JWT) de volta, e passa a enviar esse token em **toda requisição seguinte** — aqui, como um **cookie HTTP** (`AuthTokenFilter` lê via `jwtUtils.getJwtFromCookies(request)`, não mais do header `Authorization`). O servidor não guarda "quem está logado" em lugar nenhum — a cada requisição, um filtro reconstrói a identidade a partir do token.
+
+### Classe por classe
+
+**Camada de dados**
+- `User.java` — entidade da conta (`userName`, `email`, `password` já hasheada), com `@ManyToMany` pra `Role` e (novo) pra `Address`.
+- `Role.java` / `AppRole.java` (enum `ROLE_USER`/`ROLE_SELLER`/`ROLE_ADMIN`) — `Role` é a entidade persistida, `AppRole` valida em tempo de compilação quais papéis existem; persistido como `String` via `@Enumerated(EnumType.STRING)`.
+- `UserRepository` / `RoleRepository` — `findByUserName`, `existsByUserName`, `existsByEmail`, `findByRoleName`.
+
+**Ponte entre `User` e o Spring Security**
+- `UserDetailsImpl` (implements `UserDetails`) — adaptador: embrulha os dados de `User` no formato que o Spring Security entende. `build(User user)` converte `Set<Role>` em `List<GrantedAuthority>` (`SimpleGrantedAuthority` por papel). Métodos `isAccountNonExpired`/`isAccountNonLocked`/etc. sempre `true` (sem bloqueio/expiração implementados ainda).
+- `UserDetailsServiceImpl` (implements `UserDetailsService`) — único método `loadUserByUsername`: busca o `User` via `UserRepository` e devolve `UserDetailsImpl.build(user)`. É o ponto de entrada que o Spring Security usa pra achar um usuário durante o login.
+
+**JWT**
+- `JwtUtils` — gera o token (`generateTokenFromUsername`, assinado com `jwtSecret`, expira em `jwtExpirationMs`), empacota num cookie (`generateJwtCookie`, nome vindo de `jwtCookieName`, `path("/api")`, `maxAge` 24h), extrai o token de um cookie recebido (`getJwtFromCookies`), valida assinatura/expiração (`validateJwtToken`, tratando `MalformedJwtException`/`ExpiredJwtException`/`UnsupportedJwtException`/`IllegalArgumentException`), extrai o username de dentro do token (`getUserNameFromJwtToken`), e gera um cookie "vazio" pro logout (`getCleanJwtCookie`).
+- `AuthTokenFilter` (estende `OncePerRequestFilter`) — roda em **toda** requisição: extrai o JWT do cookie, valida, busca o `UserDetails` de novo via `UserDetailsServiceImpl`, monta um `UsernamePasswordAuthenticationToken` e popula `SecurityContextHolder` — reconstruindo a identidade a cada chamada, sem sessão.
+- `AuthEntryPointJwt` (implements `AuthenticationEntryPoint`) — chamado quando falta autenticação válida num recurso protegido; devolve JSON 401 (`{status, error, message, path}`) em vez da tela de login HTML padrão do Spring.
+
+**DTOs**
+- `LoginRequest` (`username`+`password`, `@NotBlank`) e `SignupRequest` (`username`/`email`/`password` com `@Size`, `role: Set<String>` opcional) em `security/request/`.
+- `MessageResponse` (`{message}`) e `UserInfoResponse` (`id`, `username`, `roles`, opcionalmente `jwtToken` — dois construtores) em `security/response/`.
+
+**Configuração central**
+- `WebSecurityConfig` — define: `authenticationProvider()` (`DaoAuthenticationProvider` com `UserDetailsServiceImpl` + `PasswordEncoder`), `passwordEncoder()` (`BCryptPasswordEncoder`), `authenticationManager(...)` (exposto como bean pro Controller usar), `filterChain(HttpSecurity)` (regras de URL — `/api/auth/**`, `/h2-console/**`, `/swagger-ui/**`, `/api/test/**`, `/images/**` liberados; `/api/admin/**` e `/api/public/**` estão **comentados no momento**, então caem em `anyRequest().authenticated()` — ou seja, Categoria/Produto agora exigem login; registra `AuthTokenFilter` antes do `UsernamePasswordAuthenticationFilter`; `sessionCreationPolicy(STATELESS)`), e um `CommandLineRunner` (`initData`) que roda na subida da aplicação criando os 3 papéis e 3 usuários de teste (`user1`, `seller1`, `admin`) com senhas hasheadas.
+
+**Controller**
+- `AuthController` (`/api/auth`): `POST /signin` (autentica via `AuthenticationManager`, gera cookie JWT, devolve `UserInfoResponse` + header `Set-Cookie`), `POST /signup` (valida duplicidade, hasheia senha, resolve papéis), `GET /username`/`GET /user` (dados do usuário autenticado na requisição atual), `POST /signout` (devolve cookie "vazio" via `getCleanJwtCookie`).
+
+### Fluxo completo
+
+**Login (`POST /api/auth/signin`)**: Controller chama `authenticationManager.authenticate(new UsernamePasswordAuthenticationToken(username, password))` → delega pro `DaoAuthenticationProvider` → que chama `UserDetailsServiceImpl.loadUserByUsername` (busca no banco, converte pra `UserDetailsImpl`) → compara a senha enviada com o hash salvo via `PasswordEncoder` (BCrypt, nunca texto puro) → se bater, devolve `Authentication` preenchido; o Controller extrai o `UserDetailsImpl`, pede o cookie JWT ao `JwtUtils`, devolve a resposta com `Set-Cookie`.
+
+**Requisição autenticada depois do login** (ex.: `GET /api/auth/user`): o navegador manda o cookie automaticamente → `AuthTokenFilter` intercepta **antes** de qualquer Controller, extrai e valida o JWT, busca o usuário de novo, popula `SecurityContextHolder` → o Controller recebe `Authentication` já pronto. Se o token estiver ausente/inválido num recurso protegido, `AuthEntryPointJwt` devolve 401 em JSON.
+
+### Observação (não corrigida ainda)
+`UserDetailsImpl` sobrescreve `equals()` mas não `hashCode()` (o Lombok avisa isso) — viola o contrato equals/hashCode do Java, podendo causar bugs sutis se o objeto for usado como chave de `HashMap`/`HashSet`. Também, `AuthController.authenticateUser` devolve **404** em credenciais inválidas, quando o status mais correto seria **401 Unauthorized**.
+
+### 📌 Resumo
+O módulo de autenticação implementa login stateless com JWT entregue via cookie HTTP: `User`/`Role`/`AppRole` são o modelo de dados, traduzidos para o mundo do Spring Security por `UserDetailsImpl` (adaptador que embrulha `User` no formato `UserDetails`) e `UserDetailsServiceImpl` (busca o usuário por username); `JwtUtils` concentra toda a criptografia do token (gerar, validar, extrair username, embrulhar em cookie); `AuthTokenFilter` roda em toda requisição reconstruindo a identidade do usuário a partir do cookie (sem sessão no servidor), enquanto `AuthEntryPointJwt` devolve 401 em JSON quando falta autenticação válida; `WebSecurityConfig` amarra tudo — define o `AuthenticationProvider`, o `PasswordEncoder` (BCrypt), as regras de URL liberadas vs protegidas, registra o filtro JWT antes do filtro padrão do Spring, e popula dados de teste na subida via `CommandLineRunner`; e `AuthController` expõe os endpoints `/signin`, `/signup`, `/username`, `/user` e `/signout` que costuram esse fluxo pro cliente. No login, o `AuthenticationManager` delega pro `DaoAuthenticationProvider`, que usa `UserDetailsServiceImpl` pra buscar o usuário e `PasswordEncoder` pra comparar a senha hasheada; em requisições seguintes, é o `AuthTokenFilter` quem reidentifica o usuário a partir do cookie, a cada chamada.
+
+---
+
 *Arquivo criado para consulta pessoal de estudo — atualizar conforme novos conceitos forem estudados no projeto.*
