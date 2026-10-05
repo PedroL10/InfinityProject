@@ -2,10 +2,8 @@ package com.ecommerce.project.service;
 
 import java.io.IOException;
 import java.util.List;
-import java.util.stream.Collectors;
 
 import org.modelmapper.ModelMapper;
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.data.domain.Page;
@@ -20,7 +18,6 @@ import com.ecommerce.project.exceptions.ResourceNotFoundException;
 import com.ecommerce.project.model.Cart;
 import com.ecommerce.project.model.Category;
 import com.ecommerce.project.model.Product;
-import com.ecommerce.project.payload.CartDTO;
 import com.ecommerce.project.payload.ProductDTO;
 import com.ecommerce.project.payload.ProductResponse;
 import com.ecommerce.project.repositories.CartRepository;
@@ -33,15 +30,13 @@ import lombok.RequiredArgsConstructor;
 @RequiredArgsConstructor
 public class ProductServiceImpl implements ProductService {
 
-        @Autowired
-        private CartRepository cartRepository;
-
-        @Autowired
-        private CartService cartService;
-
         private final ProductRepository productRepository;
 
         private final CategoryRepository categoryRepository;
+
+        private final CartRepository cartRepository;
+
+        private final CartService cartService;
 
         private final ModelMapper modelMapper;
 
@@ -189,24 +184,17 @@ public class ProductServiceImpl implements ProductService {
                                 ((productFromDb.getDiscount() * 0.01) * productFromDb.getPrice());
                 productFromDb.setSpecialPrice(specialPrice);
 
-                Product savedProduct = productRepository.save(productFromDb);
+                Product savedProduct;
+                try {
+                        savedProduct = productRepository.saveAndFlush(productFromDb);
+                } catch (DataIntegrityViolationException e) {
+                        throw new APIException(
+                                        "Product with the name " + productFromDb.getProductName()
+                                                        + " already exists in this category!!!");
+                }
 
                 List<Cart> carts = cartRepository.findCartsByProductId(productId);
-
-                List<CartDTO> cartDTOs = carts.stream().map(cart -> {
-                        CartDTO cartDTO = modelMapper.map(cart, CartDTO.class);
-
-                        List<ProductDTO> products = cart.getCartItems().stream()
-                                        .map(p -> modelMapper.map(p.getProduct(), ProductDTO.class))
-                                        .collect(Collectors.toList());
-
-                        cartDTO.setProducts(products);
-
-                        return cartDTO;
-
-                }).collect(Collectors.toList());
-
-                cartDTOs.forEach(cart -> cartService.updateProductInCarts(cart.getCartId(), productId));
+                carts.forEach(cart -> cartService.updateProductInCarts(cart.getCartId(), productId));
 
                 return modelMapper.map(savedProduct, ProductDTO.class);
         }
@@ -216,7 +204,6 @@ public class ProductServiceImpl implements ProductService {
                 Product product = productRepository.findById(productId)
                                 .orElseThrow(() -> new ResourceNotFoundException("Product", "productId", productId));
 
-                // DELETE
                 List<Cart> carts = cartRepository.findCartsByProductId(productId);
                 carts.forEach(cart -> cartService.deleteProductFromCart(cart.getCartId(), productId));
 

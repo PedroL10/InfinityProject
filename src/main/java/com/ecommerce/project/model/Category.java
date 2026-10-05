@@ -14,7 +14,9 @@ import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.Size;
 import lombok.AllArgsConstructor;
 import lombok.Data;
+import lombok.EqualsAndHashCode;
 import lombok.NoArgsConstructor;
+import lombok.ToString;
 
 @Entity(name = "categories")
 @Data
@@ -30,6 +32,8 @@ public class Category {
     @Column(unique = true)
     private String categoryName;
 
+    @ToString.Exclude
+    @EqualsAndHashCode.Exclude
     @OneToMany(mappedBy = "category", cascade = CascadeType.ALL)
     private List<Product> products = new ArrayList<>();
 }

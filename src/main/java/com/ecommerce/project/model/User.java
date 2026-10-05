@@ -23,6 +23,7 @@ import jakarta.validation.constraints.Email;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.Size;
 import lombok.Data;
+import lombok.EqualsAndHashCode;
 import lombok.Getter;
 import lombok.NoArgsConstructor;
 import lombok.Setter;
@@ -76,10 +77,12 @@ public class User {
     private List<Address> addresses = new ArrayList<>();
 
     @ToString.Exclude
-    @OneToOne(mappedBy = "user", cascade = { CascadeType.PERSIST, CascadeType.MERGE }, orphanRemoval = true)
+    @EqualsAndHashCode.Exclude
+    @OneToOne(mappedBy = "user", cascade = { CascadeType.PERSIST, CascadeType.MERGE, CascadeType.REMOVE })
     private Cart cart;
 
     @ToString.Exclude
+    @EqualsAndHashCode.Exclude
     @OneToMany(mappedBy = "user", cascade = { CascadeType.PERSIST, CascadeType.MERGE }, orphanRemoval = true)
     private Set<Product> products;
 }

@@ -13,6 +13,8 @@ public interface CartService {
 
     CartDTO getCart(String emailId, Long cartId);
 
+    CartDTO getLoggedUserCart();
+
     @Transactional
     CartDTO updateProductQuantityInCart(Long productId, Integer quantity);
 

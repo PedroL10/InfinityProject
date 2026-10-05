@@ -2,7 +2,7 @@
 
 Documento de arquitetura e referência técnica do projeto, mantido como material de apoio para explicar o projeto em entrevistas. Diferente do `notas-de-estudo.md` (que registra perguntas e respostas pontuais sobre conceitos), este arquivo descreve o projeto como um todo: visão geral, arquitetura, decisões de design e pontos de atenção.
 
-> Última atualização: 2026-10-02 (rodada de correções: autenticação, produto, categoria e injeção por construtor)
+> Última atualização: 2026-10-03 (módulo de Carrinho — commit `f89628d`; pendências novas na seção 9)
 
 ---
 
@@ -79,26 +79,35 @@ com.ecommerce.project
 ├── controller/
 │   ├── CategoryController.java  # endpoints de Categoria
 │   ├── ProductController.java    # endpoints de Produto
+│   ├── CartController.java       # endpoints de Carrinho (/api/carts/**, /api/cart/**)
 │   └── AuthController.java       # endpoints de autenticação (/api/auth/**)
 ├── service/
 │   ├── CategoryService.java / CategoryServiceImpl.java
 │   ├── ProductService.java / ProductServiceImpl.java
+│   ├── CartService.java / CartServiceImpl.java   # carrinho: adicionar/atualizar/remover itens
 │   └── FileService.java / FileServiceImpl.java   # upload de imagem de produto
 ├── repositories/
 │   ├── CategoryRepository.java
 │   ├── ProductRepository.java
+│   ├── CartRepository.java       # inclui busca de carrinhos por produto e por e-mail do usuário
+│   ├── CartItemRepository.java
 │   ├── UserRepository.java
 │   └── RoleRepository.java
 ├── model/
 │   ├── Category.java   # @OneToMany Product
-│   ├── Product.java    # @ManyToOne Category, @ManyToOne User (vendedor)
-│   ├── User.java        # @ManyToMany Role, @ManyToMany Address, @OneToMany Product
+│   ├── Product.java    # @ManyToOne Category, @ManyToOne User (vendedor), @OneToMany CartItem
+│   ├── User.java        # @ManyToMany Role/Address, @OneToMany Product, @OneToOne Cart
+│   ├── Cart.java        # @OneToOne User, @OneToMany CartItem, totalPrice
+│   ├── CartItem.java    # @ManyToOne Cart, @ManyToOne Product, quantity, preço e desconto no momento da inclusão
 │   ├── Role.java / AppRole.java (enum)
 │   └── Address.java
 ├── payload/
 │   ├── CategoryDTO.java / CategoryResponse.java
 │   ├── ProductDTO.java / ProductResponse.java
+│   ├── CartDTO.java / CartItemDTO.java
 │   └── APIResponse.java           # DTO envelope {message, status} para respostas de erro
+├── util/
+│   └── AuthUtil.java              # obtém o usuário logado a partir do SecurityContext
 ├── exceptions/
 │   ├── ResourceNotFoundException.java
 │   ├── APIException.java
@@ -180,6 +189,15 @@ Fluxo análogo para `POST`/`PUT`/`DELETE`, todos recebendo/devolvendo `CategoryD
 | GET | `/api/auth/user` | — | 200 + `UserInfoResponse` | requer cookie JWT válido |
 | POST | `/api/auth/signout` | — | 200 + `MessageResponse`, cookie JWT limpo | — |
 
+### Carrinho (todos exigem login)
+| Método | Endpoint | Request body | Resposta de sucesso | Camada que valida/lança erro |
+|---|---|---|---|---|
+| POST | `/api/carts/products/{productId}/quantity/{quantity}` | — | 201 + `CartDTO` | `ResourceNotFoundException` (404) se produto não existe; `APIException` (400) se produto já está no carrinho, sem estoque, ou quantidade maior que o estoque |
+| GET | `/api/carts` | — | 302 (`FOUND`) + lista de `CartDTO` | `APIException` (400) se não existir nenhum carrinho — ⚠️ status deveria ser 200 (ver seção 9) |
+| GET | `/api/carts/users/cart` | — | 200 + `CartDTO` do usuário logado | — (NPE se o usuário ainda não tiver carrinho — ver seção 9) |
+| PUT | `/api/cart/products/{productId}/quantity/{operation}` | — | 200 + `CartDTO` | `operation` = `delete` diminui 1, qualquer outro valor aumenta 1; `APIException` (400) se a quantidade resultante for negativa ou se o produto não estiver no carrinho |
+| DELETE | `/api/carts/{cartId}/product/{productId}` | — | 200 + mensagem de texto | `ResourceNotFoundException` (404) se carrinho ou item não existir |
+
 Erros (`APIException`/`ResourceNotFoundException`) sempre voltam como `APIResponse` (`{message, status: false}`); falhas de `@Valid` voltam como `Map<String,String>` (`{campo: mensagem}`); qualquer outra exceção inesperada agora também volta como `APIResponse` (500), via o handler genérico do `MyGlobalExceptionHandler`.
 
 > **Importante**: no `WebSecurityConfig`, `/api/public/**` é `permitAll()` (leitura de categorias/produtos sem login); `/api/admin/**` fica **de propósito** fora do `permitAll()`, exigindo um cookie JWT válido (qualquer usuário autenticado — autorização por papel específico, tipo `hasRole("ADMIN")`, ainda não implementada). Veja o guia de testes (seção 11) para o passo a passo de login antes de testar os endpoints `/api/admin/**`.
@@ -203,6 +221,15 @@ Erros (`APIException`/`ResourceNotFoundException`) sempre voltam como `APIRespon
 3. 🟢 **`spring.app.jwtSecret` com valor placeholder em `application.properties` versionado** — já externalizado via `${JWT_SECRET:...}`; em produção, a variável de ambiente precisa ser definida com um valor real.
 4. 🟢 **Autorização por papel ainda não implementada** — `/api/admin/**` exige login (qualquer usuário autenticado), mas não restringe por papel (`hasRole("ADMIN")`/`hasRole("SELLER")`); qualquer usuário logado, independente do papel, consegue criar/editar/deletar categorias e produtos hoje.
 5. 🟢 **`APIResponse.status` sempre `false` nos handlers atuais** — o campo existe para indicar sucesso/falha, mas só é usado no caminho de erro.
+
+### Carrinho — pendências
+Os itens 6 a 16 do commit `f89628d` foram corrigidos em 2026-10-05 (ver `notas-de-estudo.md`, seção 15). Permanece aberto:
+- 🟡 **Reserva de estoque no checkout ainda não existe** — o carrinho só valida disponibilidade. A decisão atômica (`UPDATE ... WHERE quantity >= :qty`) deve ser feita quando o pedido for criado (ver memória `project_stock_race_condition`).
+- 🔴 **Excluir produto que está em carrinho retorna 500** — `ProductServiceImpl.deleteProduct` remove os itens com `DELETE` em massa (JPQL), que deixa o `CartItem` gerenciado apontando para o produto removido (`TransientPropertyValueException`). Correção sugerida: remover os itens pela entidade, em vez de `DELETE` em massa (ver `notas-de-estudo.md`, seção 16.4).
+- 🟡 **Decisão de negócio pendente** — o carrinho deve ser apagado junto com o usuário? A configuração atual faz isso (`orphanRemoval` já propagava `REMOVE`). Confirmar com o dono do projeto (ver `notas-de-estudo.md`, seção 16.3).
+
+Corrigidos nesta rodada (seção 16 de `notas-de-estudo.md`): consulta `findCartsByProductId` que limitava os itens carregados (verificada com a sincronização de preço).
+
 
 ### Já corrigidos (histórico)
 19. ~~`updateCategory` não retorna os dados atualizados~~ — corrigido: devolve `CategoryDTO` atualizado.
@@ -236,6 +263,17 @@ Erros (`APIException`/`ResourceNotFoundException`) sempre voltam como `APIRespon
 47. ~~`APIResponse.message` era campo `public`~~ (2026-10-02) — corrigido para `private`.
 48. ~~Injeção por campo em vez de construtor~~ (2026-10-02) — convertido para `@RequiredArgsConstructor`/`final` em `CategoryController`, `CategoryServiceImpl`, `ProductController`, `ProductServiceImpl`, `AuthController`, `WebSecurityConfig`, `UserDetailsServiceImpl` e `AuthTokenFilter`.
 49. ~~Arquivos órfãos `security/jwt/LoginRequest.java`/`LoginResponse.java`~~ (2026-10-02) — duplicados sem nenhuma referência no projeto, removidos.
+50. ~~`updateProduct` sem tratamento de duplicidade (regressão do commit `f89628d`)~~ (2026-10-05) — `saveAndFlush` dentro de `try/catch` restaurado.
+51. ~~Estoque sobrescrito por leitura do carrinho (`getCart`)~~ (2026-10-05) — quantidade definida só no `ProductDTO`.
+52. ~~Ciclos de `equals`/`hashCode`/`toString` entre entidades~~ (2026-10-05) — `@EqualsAndHashCode.Exclude` e `@ToString.Exclude` no lado de volta.
+53. ~~`Product.products` mal nomeado e `EAGER`~~ (2026-10-05) — campo removido (não era usado).
+54. ~~`updateProductQuantityInCart` salvava item já removido~~ (2026-10-05) — fluxo reescrito com retorno antecipado e total recalculado.
+55. ~~NPE sem carrinho~~ (2026-10-05) — 404 em `GET /api/carts/users/cart` e 400 em `PUT`, com mensagem clara.
+56. ~~Lógica do carrinho do usuário no controller~~ (2026-10-05) — movida para `CartService.getLoggedUserCart()`.
+57. ~~`@Autowired` em campo em `ProductServiceImpl`, `CartServiceImpl` e `CartController`~~ (2026-10-05) — injeção por construtor.
+58. ~~`GET /api/carts` retornava 302~~ (2026-10-05) — agora 200.
+59. ~~Comentário `// DELETE` solto~~ (2026-10-05) — removido.
+60. ~~Item recém-adicionado omitido na resposta de `addProductToCart`~~ (2026-10-05) — achado na revisão; corrigido.
 
 ## 10. Perguntas comuns de entrevista sobre este projeto (e como responder)
 
@@ -420,7 +458,50 @@ DELETE /api/admin/products/{productId}
 ```
 ✅ 200 + `ProductDTO` removido.
 
-### 11.4 Checklist geral
+### 11.4 Carrinho (logado como `user1`, por exemplo — o carrinho é criado sob demanda na primeira inclusão)
+
+Antes de testar: o produto precisa existir, com estoque (`quantity`) maior que zero — use o produto criado no passo 10.
+
+**17. Adicionar produto ao carrinho**
+```
+POST /api/carts/products/{productId}/quantity/2
+```
+(sem body — quantidade vai no path)
+✅ 201 + `CartDTO` com `totalPrice` = `specialPrice × 2` e a lista de produtos.
+
+Repetir o mesmo produto → 400, `"Product Wireless Mouse already exists in the cart"`.
+
+**18. Ver o carrinho do usuário logado**
+```
+GET /api/carts/users/cart
+```
+✅ 200 + `CartDTO`.
+
+**19. Aumentar 1 unidade**
+```
+PUT /api/cart/products/{productId}/quantity/increase
+```
+✅ 200 + `CartDTO` com a quantidade atualizada e `totalPrice` recalculado.
+
+**20. Diminuir 1 unidade**
+```
+PUT /api/cart/products/{productId}/quantity/delete
+```
+✅ 200. Se a quantidade chegar a zero, o item é removido do carrinho.
+
+**21. Remover o produto do carrinho**
+```
+DELETE /api/carts/{cartId}/product/{productId}
+```
+✅ 200, `"Product Wireless Mouse removed from the cart !!!"`.
+
+**22. Listar todos os carrinhos (admin/teste)**
+```
+GET /api/carts
+```
+✅ Esperado: lista de carrinhos. ⚠️ O status atual é **302** (ver seção 9, item 13).
+
+### 11.5 Checklist geral
 - [ ] Sem logar, qualquer chamada a Categoria/Produto → 401 (`AuthEntryPointJwt`).
 - [ ] Login com usuário/senha certos → 200 + cookie; senha errada → 404 (comportamento atual, ver seção 9).
 - [ ] Cadastro com username/email repetido → 400 com mensagem clara.

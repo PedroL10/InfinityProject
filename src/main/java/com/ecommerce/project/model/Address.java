@@ -7,6 +7,7 @@ import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.Size;
 import lombok.AllArgsConstructor;
 import lombok.Data;
+import lombok.EqualsAndHashCode;
 import lombok.NoArgsConstructor;
 import lombok.ToString;
 
@@ -46,6 +47,7 @@ public class Address {
     private String pincode;
 
     @ToString.Exclude
+    @EqualsAndHashCode.Exclude
     @ManyToMany(mappedBy = "addresses")
     private List<User> users = new ArrayList<>();
 

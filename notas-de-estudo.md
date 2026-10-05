@@ -624,4 +624,260 @@ Race condition é um bug que só existe sob concorrência: duas execuções aces
 
 ---
 
+## 14. Módulo de carrinho — relacionamentos, usuário logado e preço "congelado"
+
+### Contexto
+Commit `f89628d` adicionou o carrinho: `Cart`, `CartItem`, `CartService`/`CartServiceImpl`, `CartController`, `CartRepository`/`CartItemRepository`, os DTOs `CartDTO`/`CartItemDTO` e o utilitário `AuthUtil`. Também mudou `Product` (novo `@OneToMany` para `CartItem`), `User` (novo `@OneToOne` para `Cart`) e `ProductServiceImpl` (sincroniza carrinhos quando um produto é atualizado ou removido).
+
+### Explicação
+
+**Mapa de relacionamentos**
+```java
+// User.java — lado inverso do OneToOne
+@OneToOne(mappedBy = "user", cascade = {PERSIST, MERGE}, orphanRemoval = true)
+private Cart cart;
+
+// Cart.java — lado dono (guarda user_id)
+@OneToOne
+@JoinColumn(name = "user_id")
+private User user;
+
+@OneToMany(mappedBy = "cart", cascade = {PERSIST, MERGE, REMOVE}, orphanRemoval = true)
+private List<CartItem> cartItems = new ArrayList<>();
+
+// CartItem.java — lado "muitos" de dois relacionamentos ManyToOne
+@ManyToOne @JoinColumn(name = "cart_id")    private Cart cart;
+@ManyToOne @JoinColumn(name = "product_id") private Product product;
+```
+Cada item do carrinho é uma linha da tabela `cart_items`, que aponta para um carrinho e para um produto. A tabela `cart_items` guarda a FK de ambos. O mesmo padrão `OneToMany`/`ManyToOne` da seção 9 se repete aqui: quem tem `@JoinColumn` é o dono da FK.
+
+**Usuário logado sem passar pelo controller: `AuthUtil`**
+O `SecurityContextHolder` guarda o `Authentication` da requisição atual, preenchido pelo `AuthTokenFilter` (seção 10). `AuthUtil.loggedInEmail()` pega o `getName()` (o username) e busca o `User` no banco para obter o e-mail. Como o service consegue descobrir quem está logado sem receber o usuário por parâmetro, o contexto de segurança vira uma dependência implícita da camada de negócio.
+
+**Carrinho criado sob demanda**
+`createCart()` procura o carrinho do usuário; se não existir, cria um com `totalPrice = 0`. Por isso o `GET /api/carts/users/cart` pode falhar antes da primeira inclusão de produto, já que `findCartByEmail` devolve `null` (item 8 da seção 9 de `DOCUMENTACAO-PROJETO.md`).
+
+**Preço "congelado" no item do carrinho**
+`CartItem` guarda `productPrice` e `discount` **no momento da inclusão**, e não lê o preço do `Product` toda vez. Assim uma mudança de preço não altera o total de um carrinho já montado. A exceção é `updateProductInCarts`, chamado pelo `ProductServiceImpl.updateProduct`, que reaplica o preço atual a propósito. Essa é uma decisão de negócio: escolher se o preço do carrinho segue a tabela ou fica fixo.
+
+**Cuidado com `EAGER`**
+`Product.products` (que na prática guarda `CartItem`s) está com `fetch = FetchType.EAGER`. Todo `Product` carregado traz todos os seus itens de carrinho junto. Em consultas paginadas de produtos, isso pode gerar muitas linhas extras. A regra geral é deixar `LAZY` e carregar explicitamente quando necessário.
+
+**Pegadinha: o estoque ainda não é reservado**
+`addProductToCart` valida `product.getQuantity()` mas não decrementa nada. Dois clientes podem colocar a última unidade no carrinho. Esse é exatamente o problema de lost update/overselling discutido na seção 13 e na memória `project_stock_race_condition`: a correção precisa ser feita no momento de reservar o estoque, com um `UPDATE ... WHERE quantity > 0` atômico.
+
+### 📌 Resumo
+O carrinho é modelado com `User` 1:1 `Cart` (o carrinho guarda a FK `user_id`) e `Cart` 1:N `CartItem`, e cada `CartItem` aponta para um `Product` via FK, seguindo o mesmo padrão dono/inverso dos relacionamentos anteriores. O usuário logado é obtido pelo `AuthUtil` a partir do `SecurityContextHolder`, preenchido pelo filtro JWT, então o service não recebe o usuário por parâmetro. O carrinho é criado na primeira inclusão de produto, e cada item congela o preço e o desconto do momento da inclusão, o que é uma decisão de negócio a ser mantida. Dois pontos merecem atenção: o `EAGER` em `Product` pode pesar nas consultas, e o estoque ainda não é reservado ao adicionar no carrinho, o que abre a porta para overselling no checkout.
+
+---
+
+## 15. Correções do módulo de carrinho (itens 6 a 16 da seção 9)
+
+### Verificação
+- `mvn compile` sem erros.
+- `ProjectApplicationTests` passou: o contexto do Spring sobe, o que valida a injeção por construtor e a ausência de dependências circulares.
+- Teste de fumaça com a aplicação rodando, em 14 cenários: adicionar, aumentar, diminuir até remover, carrinho inexistente, nome duplicado no update, status de `GET /api/carts`, e a verificação de que o estoque não muda ao ler o carrinho.
+
+### 15.1 Tratamento de duplicidade no update de produto
+```java
+try {
+    savedProduct = productRepository.saveAndFlush(productFromDb);
+} catch (DataIntegrityViolationException e) {
+    throw new APIException("Product with the name " + productFromDb.getProductName()
+            + " already exists in this category!!!");
+}
+```
+**Por que `saveAndFlush`:** `save()` não força o `UPDATE` no banco na hora. Sem o flush, a violação da constraint poderia estourar depois do `try`, por exemplo no commit de uma transação. `saveAndFlush` executa o SQL dentro do bloco protegido.
+
+### 15.2 Remoção da linha sem efeito
+Removida `product.setQuantity(product.getQuantity());` de `addProductToCart`. Ela não fazia nada. A reserva de estoque fica para o checkout, com um `UPDATE ... WHERE quantity >= :qty` atômico (ver `project_stock_race_condition`).
+
+### 15.3 `getCart` deixa de alterar a entidade
+Antes: `c.getProduct().setQuantity(c.getQuantity())` trocava o estoque do produto pela quantidade do carrinho dentro de uma entidade gerenciada. Com `open-in-view` ativo, isso podia ser gravado no banco.
+Depois, o helper `toCartDTO` define a quantidade só no `ProductDTO`:
+```java
+ProductDTO productDTO = modelMapper.map(item.getProduct(), ProductDTO.class);
+productDTO.setQuantity(item.getQuantity());
+```
+
+### 15.4 Ciclos em `equals`, `hashCode` e `toString`
+O `@Data` gera os três métodos com todos os campos. Como as entidades se referenciam, havia ciclos:
+- `Category.products` ↔ `Product.category`
+- `User.products` ↔ `Product.user`
+- `User.cart` ↔ `Cart.user`
+- `Cart.cartItems` ↔ `CartItem.cart`
+- `User.addresses` ↔ `Address.users`
+
+A correção é excluir o lado de volta nos dois métodos:
+```java
+@ToString.Exclude
+@EqualsAndHashCode.Exclude
+@OneToMany(mappedBy = "category", cascade = CascadeType.ALL)
+private List<Product> products = new ArrayList<>();
+```
+Os dois `@Exclude` são necessários. Se só um for usado, o ciclo continua no outro método.
+
+### 15.5 Remoção de `Product.products`
+Era uma coleção `EAGER` de `CartItem` com nome errado, e ninguém a usava (`getProducts()` não era chamado). As consultas de carrinho partem de `CartItem` pelo repositório, então o campo saiu.
+
+### 15.6 `updateProductQuantityInCart` reescrito
+Antes, quando a quantidade chegava a zero, o método chamava `deleteProductFromCart` e continuava executando. Depois ainda chamava `cartItemRepository.save(cartItem)` num item já removido, o que podia recriá-lo. O total também somava `delta × novo preço` e ignorava o preço antigo.
+Depois:
+```java
+double oldLineTotal = cartItem.getProductPrice() * cartItem.getQuantity();
+cart.setTotalPrice(cart.getTotalPrice() - oldLineTotal);
+
+if (newQuantity == 0) {
+    cart.getCartItems().remove(cartItem);   // orphanRemoval apaga a linha no flush
+    return toCartDTO(cart);
+}
+
+cartItem.setQuantity(newQuantity);
+cartItem.setProductPrice(product.getSpecialPrice());
+cartItem.setDiscount(product.getDiscount());
+cart.setTotalPrice(cart.getTotalPrice() + cartItem.getProductPrice() * newQuantity);
+```
+O método é `@Transactional`, então as entidades carregadas são gerenciadas e o JPA grava as alterações ao fim da transação. Não há `save` explícito.
+
+### 15.7 Carrinho inexistente
+- `GET /api/carts/users/cart` → 404 `Cart not found with email: ...`, via `ResourceNotFoundException`.
+- `PUT /api/cart/products/{id}/quantity/{op}` → 400 `Your cart is empty. Add a product before changing quantities.`, via `APIException`.
+
+### 15.8 Lógica do carrinho do usuário saiu do controller
+O novo `getLoggedUserCart()` no service faz a busca e monta o DTO. O `CartController` apenas delega e não depende mais de `CartRepository` nem de `AuthUtil`.
+
+### 15.9 Injeção por construtor
+`ProductServiceImpl` passou a receber `cartRepository` e `cartService` pelo construtor, como os demais campos. `CartServiceImpl` e `CartController` também usam `@RequiredArgsConstructor`, para manter o padrão do projeto.
+
+### 15.10 Status de `GET /api/carts`
+`HttpStatus.FOUND` (302) trocado por `HttpStatus.OK` (200).
+
+### 15.11 Comentário solto removido
+O `// DELETE` em `ProductServiceImpl.deleteProduct`.
+
+### 15.12 Carrinho acompanha a remoção do usuário
+```java
+@OneToOne(mappedBy = "user", cascade = { CascadeType.PERSIST, CascadeType.MERGE, CascadeType.REMOVE })
+private Cart cart;
+```
+**Correção do que foi escrito antes:** a configuração original já tinha `orphanRemoval = true`, e pela especificação JPA (e na implementação do Hibernate) esse atributo também propaga `REMOVE` quando o dono é apagado. Ou seja, apagar o usuário já apagava o carrinho. A mudança para `CascadeType.REMOVE` deixa essa intenção explícita, e o efeito real é outro: sem `orphanRemoval`, remover o carrinho de `user.cart` (`setCart(null)`) não apaga mais o carrinho. Esse fluxo não existe no sistema. Não há hoje nenhum endpoint ou código que apague um usuário, então a decisão ainda não tem efeito prático. Ver seção 16.
+
+### 15.13 Item recém-adicionado não aparecia na resposta
+Achado ao reescrever `addProductToCart`: `cartItemRepository.save(newCartItem)` não inclui o item na coleção `cart.getCartItems()` que já estava em memória, então a resposta omitia o produto recém-adicionado. Corrigido com `cart.getCartItems().add(newCartItem);`. Confirmado no teste de fumaça.
+
+### 15.14 Sincronização de preço no update do produto
+Antes, o método mapeava todos os carrinhos para DTO só para obter os IDs. Agora itera sobre as entidades diretamente:
+```java
+carts.forEach(cart -> cartService.updateProductInCarts(cart.getCartId(), productId));
+```
+
+### Observação (corrigida na seção 16.1)
+`CartRepository.findCartsByProductId` usava `JOIN FETCH c.cartItems ci JOIN FETCH ci.product p WHERE p.id = ?1`. O filtro `WHERE` também limita os `cartItems` carregados, então cada carrinho retornado traz só o item daquele produto, e não todos os itens. Hoje o resultado só é usado para obter IDs, então não há efeito visível. Se algum dia for usado para exibir o carrinho, precisa de outra consulta.
+
+### 📌 Resumo
+As correções do módulo de carrinho removeram os efeitos colaterais que estavam escondidos no código. O update de produto voltou a tratar duplicidade, agora com `saveAndFlush` para que a violação caia dentro do `try`. O carrinho deixou de alterar o estoque ao ser lido. Os ciclos de `equals`, `hashCode` e `toString` foram quebrados excluindo o lado de volta, e a coleção `Product.products` foi removida. O `updateProductQuantityInCart` ganhou fluxo linear, sem reinserir itens já apagados e com o total recalculado corretamente. Carrinho inexistente agora gera 404 ou 400 claros, a lógica do carrinho do usuário saiu do controller e a injeção ficou por construtor. Durante a revisão, também corrigi o item recém-adicionado que não aparecia na resposta. A decisão mais importante é a do `CascadeType.REMOVE` no carrinho, que precisa ser confirmada pelo dono do projeto.
+
+---
+
+## 16. Consulta de carrinhos por produto, `orphanRemoval` x `CascadeType.REMOVE` e um bug de exclusão
+
+### Contexto
+Três pendências da seção 15 do `DOCUMENTACAO-PROJETO.md`: a consulta `findCartsByProductId`, a reserva de estoque no checkout e a decisão sobre o `CascadeType.REMOVE` do carrinho.
+
+### 16.1 Consulta que limitava os itens do carrinho
+Antes:
+```java
+@Query("SELECT c FROM Cart c JOIN FETCH c.cartItems ci JOIN FETCH ci.product p WHERE p.id = ?1")
+List<Cart> findCartsByProductId(Long productId);
+```
+O `WHERE` filtra também os `ci` carregados pelo `JOIN FETCH`. Cada carrinho voltava só com o item do produto consultado, e não com todos os itens.
+
+Depois:
+```java
+@Query("SELECT DISTINCT c FROM Cart c JOIN c.cartItems ci WHERE ci.product.productId = ?1")
+List<Cart> findCartsByProductId(Long productId);
+```
+Aqui o `JOIN` serve só para filtrar os carrinhos. `cartItems` não é carregado pela consulta; se for acessado depois, o Hibernate carrega a coleção completa. O `DISTINCT` evita repetir um carrinho que tenha mais de um item ligado ao produto.
+
+Verificação: o teste de atualização de preço passou. Ao subir o preço de 100 para 200 com 10% de desconto, o carrinho com 2 unidades foi de 180 para 360, e o `specialPrice` do item foi para 180. Isso mostra que `updateProductInCarts` recebeu os carrinhos corretos.
+
+### 16.2 Reserva de estoque no checkout — não executada
+A reserva depende de um fluxo de pedido que ainda não existe. Implementar agora exigiria criar `Order`, escolher o momento do pagamento e decidir o que acontece com o carrinho depois. Não fiz isso porque seriam decisões de negócio. O decremento atômico (`UPDATE ... WHERE quantity >= :qty`, verificando as linhas afetadas) deve ser implementado junto com a criação do pedido.
+
+### 16.3 `CascadeType.REMOVE` no carrinho
+Configuração atual:
+```java
+// User.java
+@OneToOne(mappedBy = "user", cascade = { PERSIST, MERGE, REMOVE })
+private Cart cart;
+
+// Cart.java
+@OneToMany(mappedBy = "cart", cascade = { PERSIST, MERGE, REMOVE }, orphanRemoval = true)
+private List<CartItem> cartItems = new ArrayList<>();
+```
+Há dois mecanismos diferentes:
+- **`cascade = REMOVE`**: quando a entidade dona é apagada, a operação de remoção é propagada para a entidade relacionada.
+- **`orphanRemoval = true`**: quando uma entidade é removida da coleção ou do campo do pai (por exemplo, `cart.getCartItems().remove(item)` ou `user.setCart(null)`), ela é apagada no flush. Pela especificação JPA, `orphanRemoval` também propaga `REMOVE` quando o pai é apagado.
+
+Por isso a mudança em `User.cart` quase não altera a exclusão do usuário: antes já havia propagação via `orphanRemoval`. A diferença real é que `user.setCart(null)` deixou de apagar o carrinho. Nenhum código do projeto faz isso.
+
+**A decisão em aberto é de negócio:** quando um usuário é apagado, o carrinho deve ser apagado também? Se sim, a configuração atual está correta. Se o carrinho precisar ser preservado (por histórico, por exemplo), é preciso mudar a estratégia, por exemplo marcando o usuário como inativo em vez de apagá-lo. Vale notar que `User.products` também tem `orphanRemoval`, então apagar um vendedor levaria junto os produtos dele, o que pode bater em outras FKs.
+
+### 16.4 Bug encontrado: excluir produto que está em carrinho dá 500
+Reproduzido com a aplicação rodando: o admin excluiu um produto que estava no carrinho do `user1`, e a resposta foi:
+```
+TransientPropertyValueException: Persistent instance of 'CartItem' references an unsaved transient instance of 'Product'
+```
+A causa provável está em `ProductServiceImpl.deleteProduct`. Ele chama `deleteProductFromCart`, que apaga o item com um `DELETE` em massa (JPQL). Esse `DELETE` não remove a entidade `CartItem` do contexto de persistência, que continua apontando para o `Product`. Depois, `productRepository.delete(product)` marca o produto para remoção, e no flush o `CartItem` ainda gerenciado referencia um produto removido.
+
+Esse fluxo foi introduzido pelo commit do carrinho, e não havia teste para ele. Correção sugerida, ainda não aplicada: remover os itens pela própria entidade (`cartItemRepository.delete(item)` e remoção da coleção do carrinho) em vez de `DELETE` em massa, ou dar `flush` e `clear` depois da remoção.
+
+### 📌 Resumo
+A consulta de carrinhos por produto passou a filtrar só os carrinhos, sem limitar os itens carregados, e a sincronização de preço foi testada com sucesso. A reserva de estoque no checkout não foi implementada porque depende de um fluxo de pedido que ainda não existe. Sobre `CascadeType.REMOVE`: a configuração original já apagava o carrinho junto com o usuário, por causa do `orphanRemoval`, então a mudança quase não altera a exclusão; a diferença real está em desvincular o carrinho do usuário, o que o sistema não faz. A decisão de negócio é se o carrinho deve sobreviver à exclusão do usuário. Durante o teste apareceu um bug: excluir um produto que está em carrinho retorna 500 por causa do `DELETE` em massa, e a correção proposta ainda não foi aplicada.
+
+---
+
+## 17. Mudanças staged: `CartController`, `CartServiceImpl` e `ProductServiceImpl`
+
+### Contexto
+Os três arquivos estão no índice do git (staged). Explicam as correções das seções 15 e 16 que estão nesses arquivos.
+
+### 17.1 `CartController`
+- **Injeção por construtor.** Os três campos `@Autowired` (`CartRepository`, `AuthUtil`, `CartService`) viraram um único campo `private final CartService cartService`, com `@RequiredArgsConstructor`. O controller não conhece mais o repositório nem o utilitário de autenticação.
+- **Lógica do usuário logado no service.** O método `getCartById` buscava o carrinho pelo e-mail e chamava `getCart`. Agora `getLoggedUserCart()` faz tudo no service, e o controller só delega. Renomeado para `getLoggedUserCart` para refletir o que ele faz.
+- **Status 200.** `GET /api/carts` devolvia `HttpStatus.FOUND` (302). Trocado para `HttpStatus.OK`.
+
+### 17.2 `CartServiceImpl`
+- **Injeção por construtor.** Os campos `@Autowired` (inclusive os sem `private`) viraram `private final`, com `@RequiredArgsConstructor`.
+- **`addProductToCart`:**
+  - Removida a linha `product.setQuantity(product.getQuantity())`, que não fazia nada.
+  - Adicionada `cart.getCartItems().add(newCartItem)`. Sem ela, a resposta não incluía o item recém-adicionado, porque a coleção em memória não tinha sido atualizada.
+  - A montagem da resposta foi substituída por `toCartDTO(cart)`.
+- **`getCart`:** deixou de sobrescrever a quantidade do produto na entidade. Agora usa `toCartDTO`, que define a quantidade só no `ProductDTO`.
+- **`getLoggedUserCart` (novo):** busca o carrinho do usuário logado. Se não existir, lança `ResourceNotFoundException` (404).
+- **`updateProductQuantityInCart`:**
+  - Se o usuário não tem carrinho, lança `APIException` (400) em vez de dar NPE.
+  - Removida a busca redundante `cartRepository.findById(cartId)`.
+  - Calcula `oldLineTotal`, subtrai do total e, se a quantidade zerar, remove o item da coleção e retorna. O `orphanRemoval` apaga a linha no flush.
+  - Se não zerar, atualiza quantidade, preço e desconto, e soma `novoPreço × novaQuantidade` ao total. Não há mais `save` em item já removido, que podia recriá-lo.
+- **`toCartDTO` (privado):** centraliza a montagem da resposta, usada por `addProductToCart`, `getCart`, `getLoggedUserCart` e `updateProductQuantityInCart`. Define a quantidade de cada produto no DTO, sem tocar na entidade.
+
+### 17.3 `ProductServiceImpl`
+- **Injeção por construtor.** `cartRepository` e `cartService` viraram `private final`, junto com os demais campos.
+- **`updateProduct`:**
+  - O `save` virou `saveAndFlush` dentro de `try/catch`, restaurando a mensagem de nome duplicado. O flush força o `UPDATE` dentro do bloco protegido.
+  - A sincronização dos carrinhos ficou direta: `carts.forEach(cart -> cartService.updateProductInCarts(...))`. Antes, o método mapeava cada carrinho para DTO só para obter os IDs.
+- **`deleteProduct`:** removido o comentário `// DELETE`. A lógica de remoção dos carrinhos continua igual, e ainda tem o bug de 500 descrito na seção 16.4.
+
+### Atenção antes do commit
+Os três arquivos staged **não compilam sozinhos**. `CartController` e `CartServiceImpl` usam `getLoggedUserCart()`, que foi declarado em `CartService.java`, arquivo que ainda não está staged. Verificado com um checkout do índice: `cannot find symbol` e `method does not override`. Antes de commitar, é preciso incluir também:
+- `CartService.java` (declara `getLoggedUserCart`);
+- `CartRepository.java` (consulta corrigida da seção 16.1);
+- `Product.java`, `User.java`, `Category.java`, `CartItem.java` e `Address.java` (`@EqualsAndHashCode.Exclude` e `@ToString.Exclude`, e remoção de `Product.products`).
+
+### 📌 Resumo
+Os três arquivos staged concentram a parte de controller e service das correções do carrinho. O controller perdeu as dependências de repositório e de autenticação e passou a depender só do service. O `CartServiceImpl` ganhou injeção por construtor, respostas montadas por um helper único que não altera a entidade, um fluxo linear em `updateProductQuantityInCart` e tratamento de carrinho inexistente. O `ProductServiceImpl` ganhou injeção por construtor e um update que volta a tratar nome duplicado com `saveAndFlush`. Mas o commit só com esses três arquivos não compila: falta incluir `CartService.java` e as entidades e o repositório alterados.
+
+---
+
 *Arquivo criado para consulta pessoal de estudo — atualizar conforme novos conceitos forem estudados no projeto.*
